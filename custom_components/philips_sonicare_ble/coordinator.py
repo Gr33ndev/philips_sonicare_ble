@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timedelta, timezone
 import logging
+from pathlib import Path
 from typing import Any, Callable
 
 from homeassistant.core import HomeAssistant, callback
@@ -34,6 +35,13 @@ from .transport import (
 from .exceptions import TransportError
 from .condor_adapter import resolve_brushing_mode
 from .helpers import async_get_own_device
+from .motion_analysis import session_from_events, summary as motion_summary
+from .motion_recorder import (
+    RECORDINGS_DIR,
+    MotionRecorder,
+    recording_path,
+    write_recording,
+)
 from .const import (
     BLUETOOTH_ADAPTER_AUTO,
     CONF_BLUETOOTH_ADAPTER,
@@ -285,6 +293,8 @@ class PhilipsSonicareCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # bare set event as "device is awake".
         self._adv_wake = False
         self._sensor_subscribed = False
+        # The session being recorded with its motion data, while one is.
+        self._motion_recorder: MotionRecorder | None = None
         self._brushhead_read_pending = False
         self._live_cb: Callable | None = None
         # Persists the last known device data across HA restarts — the brush
@@ -1542,6 +1552,10 @@ class PhilipsSonicareCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             finally:
                 self._live_setup_done = False
                 self._sensor_subscribed = False
+                # A link that drops mid-session still leaves a recording
+                # worth keeping - a handle that switched itself off at the
+                # end of its routine ends here more often than not.
+                self._finish_motion_recording("link dropped")
                 if self._use_condor:
                     try:
                         await self._protocol.stop_live_updates()
@@ -1738,6 +1752,9 @@ class PhilipsSonicareCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         def _callback(char_uuid: str, data: bytes):
             if not data:
                 return
+
+            if self._motion_recorder is not None:
+                self._motion_recorder.record(char_uuid, data)
 
             # Brush head serial notification: detect attach/detach
             if char_uuid == CHAR_BRUSHHEAD_SERIAL:
@@ -2057,9 +2074,15 @@ class PhilipsSonicareCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if mask == 0:
             _LOGGER.debug("%s: all sensors disabled in options — skipping sensor subscribe", self.address)
             return
+        recording = self._motion_recording_wanted(mask)
+        if recording:
+            await self._start_motion_recording()
         if await self._protocol.start_sensor_stream(mask, self._live_cb):
             self._sensor_subscribed = True
             _LOGGER.info("%s: sensor data stream subscribed (session active)", self.address)
+        elif recording:
+            self._motion_recorder = None
+            await self._restore_notify_throttle()
 
     async def _unsubscribe_sensor_data(self) -> None:
         """Unsubscribe from sensor data stream and disable sensors."""
@@ -2072,6 +2095,93 @@ class PhilipsSonicareCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         await self._protocol.stop_sensor_stream()
         self._sensor_subscribed = False
         _LOGGER.info("%s: sensor data stream unsubscribed (session ended)", self.address)
+        if self._finish_motion_recording("session ended"):
+            await self._restore_notify_throttle()
+
+    # --- Motion recording ---------------------------------------------------
+    # With the motion sensor on, a Classic session is recorded whole and
+    # analysed once it ends (see motion_recorder.py / motion_analysis.py).
+    # Condor delivers the stream already decoded, so there is no raw frame
+    # to keep there.
+
+    def _motion_recording_wanted(self, mask: int) -> bool:
+        return bool(mask & SENSOR_ENABLE_GYROSCOPE) and not self._use_condor
+
+    async def _start_motion_recording(self) -> None:
+        data = self.data or {}
+        model = data.get("model_number") or self.entry.data.get("model")
+        recorder = MotionRecorder({
+            "model": model,
+            "firmware": data.get("firmware"),
+            "mode": data.get("brushing_mode"),
+            "routine_length": data.get("routine_length"),
+            "transport": "esp_bridge" if self._is_esp_bridge else "direct",
+        })
+        # The values the session started with: the analysis places frames by
+        # the handle state and the session clock, and neither notifies until
+        # it changes.
+        if (state := data.get("handle_state_value")) is not None:
+            recorder.baseline(CHAR_HANDLE_STATE, bytes([state]))
+        if (elapsed := data.get("brushing_time")) is not None:
+            recorder.baseline(CHAR_BRUSHING_TIME, int(elapsed).to_bytes(2, "little"))
+        if (routine := data.get("routine_length")) is not None:
+            recorder.baseline(CHAR_ROUTINE_LENGTH, int(routine).to_bytes(2, "little"))
+        self._motion_recorder = recorder
+        if self._is_esp_bridge:
+            # The bridge forwards at most one notification per characteristic
+            # per throttle interval and drops the rest. Pressure, temperature
+            # and motion all share the SensorData characteristic, so at the
+            # default 500 ms a recording would keep two frames a second.
+            # Lifted for the session, put back when it ends.
+            await self.transport.set_notify_throttle(0)
+        _LOGGER.info("%s: motion recording started", self.address)
+
+    async def _restore_notify_throttle(self) -> None:
+        if not self._is_esp_bridge or not self.transport.is_connected:
+            return
+        await self.transport.set_notify_throttle(
+            self.entry.options.get(CONF_NOTIFY_THROTTLE, DEFAULT_NOTIFY_THROTTLE)
+        )
+
+    def _finish_motion_recording(self, ended: str) -> bool:
+        """Hand the session being recorded to the writer. True if there was one."""
+        recorder, self._motion_recorder = self._motion_recorder, None
+        if recorder is None:
+            return False
+        meta = recorder.finish(ended)
+        path = recording_path(
+            Path(self.hass.config.path(RECORDINGS_DIR)),
+            self.entry.entry_id, meta.get("model"), recorder.wall_started,
+        )
+        self.hass.async_create_task(
+            self._store_motion_recording(path, meta, recorder.events)
+        )
+        return True
+
+    async def _store_motion_recording(
+        self, path: Path, meta: dict[str, Any], events: list[dict[str, Any]]
+    ) -> None:
+        def _work() -> dict[str, Any]:
+            write_recording(path, meta, events)
+            result = motion_summary(session_from_events(meta, events))
+            result.update({
+                "started": meta["started"],
+                "ended": meta["ended"],
+                "file": str(path.relative_to(self.hass.config.path())),
+            })
+            return result
+
+        try:
+            result = await self.hass.async_add_executor_job(_work)
+        except Exception as err:  # noqa: BLE001 - a recording must never break the session
+            _LOGGER.warning("%s: motion recording could not be stored: %s", self.address, err)
+            return
+        _LOGGER.info(
+            "%s: motion recording stored - %s frames at %s Hz, %s %% lost (%s)",
+            self.address, result.get("frames"), result.get("rate_hz"),
+            result.get("lost_pct"), result["file"],
+        )
+        self.async_set_updated_data({**(self.data or {}), "motion_recording": result})
 
     async def _stop_all_notifications(self) -> None:
         """Stop all GATT notifications."""

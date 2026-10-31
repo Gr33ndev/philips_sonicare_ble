@@ -14,7 +14,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.entity import EntityCategory
-from homeassistant.const import UnitOfTime, PERCENTAGE
+from homeassistant.const import UnitOfFrequency, UnitOfTime, PERCENTAGE
 from homeassistant.util import dt as dt_util
 
 from .coordinator import PhilipsSonicareCoordinator
@@ -144,6 +144,8 @@ async def async_setup_entry(
             SonicarePressureSensor(coordinator, entry),
             SonicarePressureStateSensor(coordinator, entry),
             SonicareTemperatureSensor(coordinator, entry),
+            # Classic only: Condor delivers no raw motion frames to record.
+            SonicareMotionRecordingSensor(coordinator, entry),
         ])
     elif is_condor:
         # Condor exposes the same pressure-state and temperature telemetry
@@ -603,6 +605,54 @@ def _routine_shape(model: str, record: dict) -> dict:
     return shape
 
 
+class SonicareMotionRecordingSensor(PhilipsSonicareEntity, SensorEntity):
+    """The last session recorded with its motion data, and what it showed.
+
+    Recorded only with the motion sensor switched on in the options. The
+    state is the rate the motion frames arrived at, because that decides
+    whether anything else here can be trusted: a recording that kept a few
+    frames a second says nothing about where the brush was.
+
+    The attributes carry the rest of the analysis (see motion_analysis.py):
+    frames lost on the way, one entry per pacing step with the handle's
+    attitude, the attitude per zone, the two zones that were held most alike,
+    and a rough recognition figure. The zone attitudes are there so that
+    sessions can be compared later from this sensor's history alone; the
+    recording itself is kept under the path in ``file``.
+    """
+
+    _attr_translation_key = "motion_recording"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_native_unit_of_measurement = UnitOfFrequency.HERTZ
+    _attr_suggested_display_precision = 1
+    _attr_icon = "mdi:axis-arrow"
+    _data_key = "motion_recording"
+
+    def __init__(self, coordinator: PhilipsSonicareCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator, entry)
+        self._attr_unique_id = f"{self._device_id}_motion_recording"
+
+    def _result(self) -> dict | None:
+        if not self.coordinator.data:
+            return None
+        return self.coordinator.data.get("motion_recording")
+
+    @property
+    def native_value(self) -> float | None:
+        result = self._result()
+        return result.get("rate_hz") if result else None
+
+    @property
+    def extra_state_attributes(self) -> dict | None:
+        result = self._result()
+        if not result:
+            return None
+        return {k: v for k, v in result.items() if k != "rate_hz"}
+
+
+# ---------------------------------------------------------------------------
+# Last Session
+# ---------------------------------------------------------------------------
 class SonicareLastSessionSensor(PhilipsSonicareEntity, SensorEntity):
     """When the handle's most recent stored session began.
 

@@ -178,7 +178,7 @@
         "data": {
           "sensor_pressure": "Drucksensor aktivieren",
           "sensor_temperature": "Temperatursensor aktivieren",
-          "sensor_gyroscope": "Gyroskop-Sensor aktivieren",
+          "sensor_gyroscope": "Bewegungsdaten aufzeichnen",
           "notify_throttle_ms": "Benachrichtigungs-Drosselung (ms)",
           "pipelined_reads": "Gebündelte GATT-Lesevorgänge",
           "warn_counterfeit_brushhead": "Vor gefälschten Bürstenköpfen warnen"
@@ -186,7 +186,7 @@
         "data_description": {
           "sensor_pressure": "Druckdaten während der Putzsitzung streamen.",
           "sensor_temperature": "Temperaturdaten während der Putzsitzung streamen.",
-          "sensor_gyroscope": "6-Achsen-Bewegungsdaten während der Putzsitzung streamen. Hohe Bandbreite — auf einem vollwertigen ESP32 in der Regel unproblematisch, auf kleineren Boards wie dem ESP32-C3 kann es zu Aussetzern kommen. Nur bei Modellen mit eingebautem Bewegungssensor verfügbar.",
+          "sensor_gyroscope": "6-Achsen-Bewegungsdaten während der Putzsitzung streamen und jede Sitzung als Aufnahme unter philips_sonicare_ble/recordings im Konfigurationsordner ablegen; der Sensor Bewegungsaufnahme zeigt, was sie gemessen hat. Über eine ESP-Bridge wird die Benachrichtigungs-Drosselung für die Dauer der Sitzung aufgehoben. Hohe Bandbreite — auf einem vollwertigen ESP32 in der Regel unproblematisch, auf kleineren Boards wie dem ESP32-C3 kann es zu Aussetzern kommen. Nur bei Modellen mit eingebautem Bewegungssensor verfügbar.",
           "notify_throttle_ms": "Mindestabstand zwischen BLE-Benachrichtigungen, die die ESP-Bridge weiterleitet. Niedrigere Werte liefern schnellere Aktualisierungen, können den ESP aber überlasten.",
           "pipelined_reads": "Lesevorgänge als einen gleichzeitigen Stapel an die ESP-Bridge senden statt einzeln nacheinander. Erfordert Bridge-Firmware 1.7.0 oder neuer (ältere Bridges lesen immer sequenziell). Deaktiviere die Option nur, wenn nach einem Bridge-Update Lesefehler auftreten.",
           "warn_counterfeit_brushhead": "Warnen, wenn nach 30 Sekunden Putzen keine gültige NFC-Seriennummer des Bürstenkopfs erkannt wurde."
@@ -313,6 +313,9 @@
       },
       "latest_session_id": {
         "name": "Letzte Sitzungs-ID"
+      },
+      "motion_recording": {
+        "name": "Bewegungsaufnahme"
       },
       "last_session": {
         "name": "Letzte Sitzung"

@@ -35,6 +35,7 @@ See [Configuration](#configuration) for setup instructions.
   - [Option A: Direct Bluetooth](#option-a-direct-bluetooth)
   - [Option B: ESP32 BLE Bridge](#option-b-esp32-ble-bridge)
   - [Option C: Bluetooth Proxy](#option-c-bluetooth-proxy)
+  - [Motion recordings](#motion-recordings)
   - [Bluetooth adapter](#bluetooth-adapter)
 - [How It Works](#how-it-works)
 - [Troubleshooting & Caveats](#troubleshooting--caveats)
@@ -175,6 +176,7 @@ These sensors are only available while actively brushing and stream live data fr
 | **Handle Time** | Sensor | Total handle operating time since manufacture (seconds). Not available on the 7100 series (HX742X). |
 | **Model Number** | Sensor | Device model number (e.g., HX992B). |
 | **Firmware** | Sensor | Installed firmware version. |
+| **Motion Recording** | Sensor | Rate in Hz of the motion frames in the last recorded session, with the analysis in the attributes (Classic models with a motion sensor, only while the Gyroscope option is on). See [Motion recordings](#motion-recordings). |
 | **Last Seen** | Sensor | Timestamp of last successful data read. |
 | **BLE RSSI** | Sensor | BLE signal strength in dBm (Direct BLE only). |
 | **Adapter** | Sensor | Name/path of the BLE adapter currently carrying the link (e.g. `hci0`, ESP device name + bridge slot). |
@@ -328,11 +330,27 @@ Setup is the same as Option A — Home Assistant's Bluetooth stack picks the pro
 | :--- | :--- | :--- |
 | Pressure Sensor | Enabled | Stream live pressure data during brushing. |
 | Temperature Sensor | Enabled | Stream live temperature data during brushing. |
-| Gyroscope Sensor | Disabled | Stream live 6-axis IMU data during brushing (experimental). |
+| Gyroscope Sensor | Disabled | Stream 6-axis motion data during brushing and keep each session as a recording (experimental, Classic models only), see [Motion recordings](#motion-recordings). Over an ESP bridge the notify throttle is lifted while a session is recorded. |
 | Notify Throttle | 500ms | Minimum interval between BLE notification updates (ESP Bridge only, 100-5000ms). |
 | Pipelined GATT reads | Enabled | Send poll reads to the ESP bridge as one concurrent batch (ESP Bridge only, needs bridge firmware ≥ 1.7.0 — older bridges always read sequentially). Takes effect immediately, no reload. |
 | Bluetooth adapter | Chosen by Home Assistant | The adapter or Bluetooth proxy the brush connects through (Direct Bluetooth only). Changed via **Change Bluetooth adapter**, see [below](#bluetooth-adapter). |
 | Warn about counterfeit brush heads | Enabled | Raise a repair warning if no valid brush head NFC serial is read after 30 seconds of brushing. |
+
+### Motion recordings
+
+An experiment, not a feature yet: the groundwork for telling which zone of the mouth the brush is in, the way the Sonicare app's location sensor does. The handle never reports a position; it only streams how it is held. Whether that is enough to tell the zones apart for a given person is what the recordings are for.
+
+With the **Gyroscope Sensor** option on, every session on a Classic handle is kept as a JSONL file under `philips_sonicare_ble/recordings/` in the Home Assistant configuration folder (the newest 30 per brush). The recording holds the model and the values the brush sent, nothing that identifies the brush or the person.
+
+The **Motion Recording** sensor shows what the last one measured: how many motion frames arrived and how many were lost, the handle's attitude per pacing step, how far apart the zones were held, and a rough recognition figure. Brush the routine as the handle paces it — one zone per buzz — because the pacing is what labels the zones.
+
+To look at recordings outside Home Assistant:
+
+```bash
+python scripts/sonicare_gyro_analyze.py recordings/*.jsonl
+```
+
+With two or more recordings it also reports how well zones learned from the other sessions recognise each one.
 
 ### Bluetooth adapter
 
