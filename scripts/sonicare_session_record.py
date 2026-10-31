@@ -15,6 +15,7 @@ Usage:
   python sonicare_session_record.py                     # scan, record 180 s
   python sonicare_session_record.py AA:BB:.. --seconds 240
   python sonicare_session_record.py --pressure          # + SensorData stream
+  python sonicare_session_record.py --gyro --quiet      # + motion sensor stream
 
   python sonicare_session_record.py --watch --pressure  # leave it running
   python sonicare_session_record.py --fetch-session     # + stored-record probe
@@ -71,6 +72,17 @@ window - which means the recording is written whenever the handle goes away,
 not only when the window runs out. Each file says which of the two happened
 in its ``ended`` field, so a short recording can be told apart from a
 complete one without guessing.
+
+Motion sensor
+-------------
+``--gyro`` switches on the handle's accelerometer and gyroscope, the data a
+position-aware app works from: where in the mouth the brush is can only be
+derived from how the handle is held, and nothing else on the handle reports
+it. The frames share the SensorData characteristic with pressure, so the two
+flags combine. The stream is fast, which is why its frames are recorded but
+not printed - ``--quiet`` is still worth adding, and a lower
+``--poll-interval`` (or 0) keeps the polled reads from competing with it.
+``sonicare_gyro_analyze.py`` turns such a recording into something to look at.
 
 Linux
 -----
@@ -218,9 +230,14 @@ def _name(uuid: str) -> str:
 class SessionRecorder:
     """Collects timestamped characteristic values for one recording."""
 
-    def __init__(self, out_path: Path, quiet: bool = False) -> None:
+    def __init__(self, out_path: Path, quiet: bool = False,
+                 mute: frozenset[str] = frozenset()) -> None:
         self.out_path = out_path
         self.quiet = quiet
+        # Characteristics recorded but never printed. The motion stream sends
+        # dozens of frames a second, and printing each would bury everything
+        # else that happens in a session.
+        self.mute = mute
         self.events: list[dict] = []
         self.started = time.monotonic()
         # Last value per characteristic, so polling only records real changes
@@ -256,7 +273,7 @@ class SessionRecorder:
         if tagged:
             event.update(self.tag)
         self.events.append(event)
-        if not self.quiet:
+        if not self.quiet and key not in self.mute:
             print(f"  [{event['t']:8.3f}] {event['char']:<22} {hex_str}")
         return True
 
@@ -349,10 +366,10 @@ async def _read_identity(client: BleakClient) -> dict:
 
 
 async def _subscribe_all(client: BleakClient, recorder: SessionRecorder,
-                         pressure: bool, storage: bool = False) -> list[str]:
+                         sensor_data: bool, storage: bool = False) -> list[str]:
     """Subscribe to every notification characteristic the handle offers."""
     wanted = list(const.NOTIFICATION_CHARS) + PROBE_CHARS
-    if pressure:
+    if sensor_data:
         wanted.append(const.CHAR_SENSOR_DATA)
     if storage:
         # Subscribed here rather than when a record is requested. The request
@@ -397,13 +414,30 @@ async def _subscribe_all(client: BleakClient, recorder: SessionRecorder,
     return subscribed
 
 
-async def _enable_pressure(client: BleakClient) -> None:
-    """Switch on the pressure substream of the SensorData port."""
+def _sensor_mask(args) -> int:
+    """The SensorData substreams the command line asks for, as the bitmask."""
+    mask = 0
+    if args.pressure:
+        mask |= const.SENSOR_ENABLE_PRESSURE
+    if args.gyro:
+        mask |= const.SENSOR_ENABLE_GYROSCOPE
+    return mask
+
+
+async def _enable_sensors(client: BleakClient, mask: int,
+                          say=print) -> None:
+    """Switch on the SensorData substreams in ``mask``.
+
+    One byte, like the integration writes it. Written again whenever a
+    session starts, because the integration only ever enables the stream on
+    a running handle and nothing says a handle keeps the bitmask across the
+    motor starting.
+    """
     try:
-        await client.write_gatt_char(const.CHAR_SENSOR_ENABLE, bytes([1]), response=True)
-        print("  pressure telemetry enabled")
+        await client.write_gatt_char(const.CHAR_SENSOR_ENABLE, bytes([mask]), response=True)
+        say(f"  sensor telemetry enabled (mask 0x{mask:02X})")
     except Exception as err:  # noqa: BLE001
-        print(f"  could not enable pressure telemetry: {err}")
+        say(f"  could not enable sensor telemetry: {err}")
 
 
 # Values the handle keeps as descriptors rather than characteristics, which
@@ -856,7 +890,7 @@ async def _fetch_stored_session(client: BleakClient, recorder: SessionRecorder,
 
 async def _poll_loop(client: BleakClient, recorder: SessionRecorder,
                      interval: float, deadline: float,
-                     fetch: bool = False) -> None:
+                     fetch: bool = False, sensor_mask: int = 0) -> None:
     """Read the session characteristics until the deadline passes.
 
     Only changed values are recorded, so an idle handle costs nothing in the
@@ -876,6 +910,8 @@ async def _poll_loop(client: BleakClient, recorder: SessionRecorder,
                 pass
 
         running = _session_is_running(recorder)
+        if sensor_mask and running and not was_running:
+            await _enable_sensors(client, sensor_mask)
         if fetch and was_running and not running:
             # Immediately, before the settle window: the handle switches
             # itself off at the end of a session and takes the link with it.
@@ -1067,9 +1103,11 @@ async def _watch_handle(device, args, slots: asyncio.Semaphore,
                 log(f"[{label}] connected - model {model or 'unreadable'}")
 
                 recorder = SessionRecorder(Path("unused"), quiet=True)
-                if args.pressure:
-                    await _enable_pressure(client)
-                await _subscribe_all(client, recorder, args.pressure, args.fetch_session)
+                sensor_mask = _sensor_mask(args)
+                if sensor_mask:
+                    await _enable_sensors(client, sensor_mask,
+                                          lambda m: log(f"[{label}]{m}"))
+                await _subscribe_all(client, recorder, bool(sensor_mask), args.fetch_session)
                 await _read_baseline(client, recorder)
                 await _read_descriptors(client, recorder)
 
@@ -1093,6 +1131,7 @@ async def _watch_handle(device, args, slots: asyncio.Semaphore,
                         "duration_s": round(time.monotonic() - recorder.started, 1),
                         "events": len(recorder.events),
                         "polled": True,
+                        "sensor_mask": sensor_mask,
                         # How the recording came to an end. "settled" is the
                         # complete case; the others say what is missing, which
                         # a fixture built from this file needs to know.
@@ -1115,6 +1154,10 @@ async def _watch_handle(device, args, slots: asyncio.Semaphore,
                             log(f"[{label}] session started")
                             saw_session = True
                             ended_at = None
+                            if sensor_mask:
+                                await _enable_sensors(
+                                    client, sensor_mask,
+                                    lambda m: log(f"[{label}]{m}"))
                         elif was_running and not running:
                             # Do not write yet. The values that describe the
                             # finished session arrive after the handle stops - a
@@ -1223,6 +1266,10 @@ async def main() -> None:
                              "and records notifications only. Default: 1.0")
     parser.add_argument("--pressure", action="store_true",
                         help="Also enable and record the SensorData pressure stream")
+    parser.add_argument("--gyro", action="store_true",
+                        help="Also enable and record the accelerometer/gyroscope "
+                             "stream (recorded, not printed). Combines with "
+                             "--pressure.")
     parser.add_argument("--out", default=None,
                         help="Output path. Default: sonicare_session_<timestamp>.jsonl")
     parser.add_argument("--quiet", action="store_true", help="Do not print every value")
@@ -1270,12 +1317,15 @@ async def main() -> None:
         print(f"Model: {meta.get('model') or 'unreadable'}  "
               f"Firmware: {meta.get('firmware') or 'unreadable'}")
 
-        recorder = SessionRecorder(out_path, quiet=args.quiet)
+        recorder = SessionRecorder(
+            out_path, quiet=args.quiet,
+            mute=frozenset({const.CHAR_SENSOR_DATA.lower()}) if args.gyro else frozenset())
+        sensor_mask = _sensor_mask(args)
 
         print("\n--- Subscribing ---")
-        if args.pressure:
-            await _enable_pressure(client)
-        await _subscribe_all(client, recorder, args.pressure, args.fetch_session)
+        if sensor_mask:
+            await _enable_sensors(client, sensor_mask)
+        await _subscribe_all(client, recorder, bool(sensor_mask), args.fetch_session)
 
         if args.mode:
             await _set_mode(client, args.mode)
@@ -1300,7 +1350,7 @@ async def main() -> None:
         try:
             if args.poll_interval > 0:
                 await _poll_loop(client, recorder, args.poll_interval, deadline,
-                                 args.fetch_session)
+                                 args.fetch_session, sensor_mask)
             else:
                 await asyncio.sleep(max(0.0, deadline - time.monotonic()))
         except (KeyboardInterrupt, asyncio.CancelledError):
@@ -1311,9 +1361,15 @@ async def main() -> None:
             "duration_s": round(time.monotonic() - recorder.started, 1),
             "events": len(recorder.events),
             "polled": args.poll_interval > 0,
+            "sensor_mask": sensor_mask,
         })
         recorder.write(meta)
         print(f"\n{len(recorder.events)} event(s) written to {out_path}")
+        if args.gyro:
+            frames = sum(1 for e in recorder.events
+                         if e.get("uuid") == const.CHAR_SENSOR_DATA.lower())
+            print(f"{frames} SensorData frame(s) among them - "
+                  "see sonicare_gyro_analyze.py")
         if not recorder.events:
             print("Nothing was captured. Either the handle stayed idle, or every "
                   "characteristic refused without a bond - see the note above.")
