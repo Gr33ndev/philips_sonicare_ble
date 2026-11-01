@@ -41,7 +41,7 @@ ZONE_ATTITUDES = {
 
 
 def _gyro(counter: int, acc) -> bytes:
-    return struct.pack("<HH6h", SENSOR_FRAME_GYROSCOPE, counter, *acc, 10, -5, 3)
+    return struct.pack("<HH6h", SENSOR_FRAME_GYROSCOPE, counter, 10, -5, 3, *acc)
 
 
 class _Transport:
@@ -103,10 +103,15 @@ def _coordinator(tmp_path: Path, gyro: bool = True, esp: bool = True, ok: bool =
     return c
 
 
-def _brush(c, seconds: int = 120, rate: int = 10) -> None:
-    """Feed a routine the way the live callback would."""
+def _brush(c, seconds: int = 120, rate: int = 10, held_in=None) -> None:
+    """Feed a routine the way the live callback would.
+
+    ``held_in`` maps a paced zone to the zone the handle is really held in,
+    for a user who does not follow the pacing.
+    """
     counter = 0
     recorder = c._motion_recorder
+    held_in = held_in or {}
     for i in range(seconds * rate):
         t = i / rate
         if i % rate == 0:
@@ -114,6 +119,7 @@ def _brush(c, seconds: int = 120, rate: int = 10) -> None:
             recorder.events[-1]["t"] = t
         counter += 1
         zone = int(t // 20) + 1
+        zone = held_in.get(zone, zone)
         recorder.record(CHAR_SENSOR_DATA, _gyro(counter, ZONE_ATTITUDES[zone]))
         recorder.events[-1]["t"] = t
 
@@ -140,6 +146,9 @@ async def test_a_session_is_recorded_analysed_and_the_throttle_restored(tmp_path
     assert [s["zone"] for s in result["steps"]] == [1, 2, 3, 4, 5, 6]
     assert result["recognition_pct"] == 100
     assert result["ended"] == "session ended"
+    assert result["jaws"]["upper_s"] == result["jaws"]["upper_expected_s"] == 60
+    assert result["jaws"]["lower_s"] == result["jaws"]["lower_expected_s"] == 60
+    assert result["jaws"]["match_pct"] == 100
 
     path = tmp_path / result["file"]
     meta, events = motion_analysis.read_recording(path)
@@ -149,6 +158,26 @@ async def test_a_session_is_recorded_analysed_and_the_throttle_restored(tmp_path
     # The recording reads back into the same analysis.
     again = motion_analysis.summary(motion_analysis.load_session(path))
     assert again["steps"] == result["steps"]
+
+
+async def test_a_step_brushed_on_the_wrong_jaw_shows_up(tmp_path):
+    """Upper front paced, lower front brushed: that step is off its jaw."""
+    c = _coordinator(tmp_path)
+    await c._subscribe_sensor_data_locked()
+    _brush(c, held_in={2: 5})
+    await c._unsubscribe_sensor_data_locked()
+    await c.tasks[0]
+    jaws = c.updates[-1]["motion_recording"]["jaws"]
+    assert jaws["upper_s"] == 40 and jaws["lower_s"] == 80
+    on_jaw = {s["step"]: s["on_jaw_pct"] for s in jaws["steps"]}
+    assert on_jaw[2] == 0
+    assert all(on_jaw[s] == 100 for s in (1, 3, 4, 5, 6))
+    assert jaws["match_pct"] == 83
+
+
+def test_the_jaw_follows_the_bristles(tmp_path):
+    assert motion_analysis.jaw_of((0, 0, 4000)) == "upper"
+    assert motion_analysis.jaw_of((3000, -2000, -500)) == "lower"
 
 
 async def test_nothing_is_recorded_without_the_motion_sensor(tmp_path):

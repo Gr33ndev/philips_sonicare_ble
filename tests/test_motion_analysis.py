@@ -32,7 +32,7 @@ ZONE_ATTITUDES = {
 
 def _gyro_hex(counter: int, acc, gyro=(10, -5, 3)) -> str:
     return struct.pack("<HH6h", SENSOR_FRAME_GYROSCOPE,
-                       counter & 0xFFFF, *acc, *gyro).hex()
+                       counter & 0xFFFF, *gyro, *acc).hex()
 
 
 def _write_recording(path: Path, rate_hz: float = 20.0, drop_every: int = 0,

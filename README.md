@@ -344,6 +344,8 @@ With the **Gyroscope Sensor** option on, every session on a Classic handle is ke
 
 The **Motion Recording** sensor shows what the last one measured: how many motion frames arrived and how many were lost, the handle's attitude per pacing step, how far apart the zones were held, and a rough recognition figure. Brush the routine as the handle paces it — one zone per buzz — because the pacing is what labels the zones.
 
+Its `jaws` attribute says how many seconds were spent on the upper and the lower jaw, against what the routine asked for, and for each pacing step how much of it was spent on the jaw its zone lies in. The jaw is read from the direction the bristles face, one second at a time, by a fixed rule: nothing is learned from earlier sessions and nothing is adjusted while brushing. Left, front and right are not told apart — held by gravity alone, the outside of one side and the inside of the other look the same.
+
 To look at recordings outside Home Assistant:
 
 ```bash

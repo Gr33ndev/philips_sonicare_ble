@@ -49,6 +49,17 @@ HANDLE_STATE_RUN = 2
 # is the most that can pass between two of them while the motor runs.
 CLOCK_SLACK_S = 1.5
 
+# Which jaw each zone of the six-zone layout lies in: the handle paces
+# upper right, upper front, upper left, then lower left, lower front, lower
+# right. The four-zone Kids layout is left out - its zones have not been
+# checked against a recording.
+ZONE_JAW = {1: "upper", 2: "upper", 3: "upper",
+            4: "lower", 5: "lower", 6: "lower"}
+
+# The jaw is judged per second of brushing, not per frame. A single frame
+# can catch the handle mid-stroke; a second of them averages that out.
+JAW_WINDOW_S = 1.0
+
 
 @dataclass
 class Frame:
@@ -80,7 +91,13 @@ def _u(hex_str: str) -> int:
 
 
 def parse_gyro_frame(hex_str: str) -> tuple[int, tuple, tuple] | None:
-    """Return (counter, acc, gyro) for a motion frame, None for anything else."""
+    """Return (counter, acc, gyro) for a motion frame, None for anything else.
+
+    The frame carries the gyroscope first and the accelerometer second, as
+    ``scripts/sonicare_scan.py`` decodes it. The accelerometer is the triplet whose magnitude stays near one g
+    (about 4096) the whole session; the gyroscope's sits near zero and spikes
+    when the handle is turned.
+    """
     raw = bytes.fromhex(hex_str)
     if len(raw) < 16:
         return None
@@ -88,7 +105,7 @@ def parse_gyro_frame(hex_str: str) -> tuple[int, tuple, tuple] | None:
     if frame_type != SENSOR_FRAME_GYROSCOPE:
         return None
     values = struct.unpack("<6h", raw[4:16])
-    return counter, values[:3], values[3:]
+    return counter, values[3:], values[:3]
 
 
 def read_recording(path: Path) -> tuple[dict, list[dict]]:
@@ -283,6 +300,65 @@ def step_table(session: Session) -> list[dict]:
     return rows
 
 
+def jaw_of(acc_sum) -> str:
+    """Upper or lower jaw, from the accelerometer's z axis.
+
+    The z axis is the one the bristles face along. On the upper teeth they
+    point up, so gravity reads positive there; on the lower teeth they point
+    down. That follows from how a brush has to be held to reach a jaw at all,
+    not from how one person holds it, so the rule is fixed: nothing is learned
+    from earlier sessions and nothing is adjusted while brushing.
+    """
+    return "upper" if acc_sum[2] > 0 else "lower"
+
+
+def jaw_coverage(session: Session) -> dict[str, Any] | None:
+    """Seconds spent on each jaw, measured, next to what the routine asked.
+
+    Judged after the session, one second of brushing at a time. Each pacing
+    step also gets the share of its seconds spent on the jaw its zone lies
+    in, which is where a step that was cut short or brushed in the wrong
+    place shows up.
+    """
+    windows: dict[int, list[Frame]] = {}
+    for frame in session.frames:
+        if frame.elapsed is not None:
+            windows.setdefault(int(frame.elapsed // JAW_WINDOW_S), []).append(frame)
+    if not windows:
+        return None
+    measured = {"upper": 0.0, "lower": 0.0}
+    expected = {"upper": 0.0, "lower": 0.0}
+    per_step: dict[int, list[int]] = {}  # step -> [on its jaw, total]
+    zone_of_step: dict[int, int | None] = {}
+    for frames in windows.values():
+        acc_sum = [sum(f.acc[i] for f in frames) for i in range(3)]
+        jaw = jaw_of(acc_sum)
+        measured[jaw] += JAW_WINDOW_S
+        step, zone = frames[0].step, frames[0].zone
+        target = ZONE_JAW.get(zone)
+        if step is None or target is None:
+            continue
+        expected[target] += JAW_WINDOW_S
+        zone_of_step[step] = zone
+        counts = per_step.setdefault(step, [0, 0])
+        counts[0] += jaw == target
+        counts[1] += 1
+    hits = sum(c[0] for c in per_step.values())
+    total = sum(c[1] for c in per_step.values())
+    return {
+        "upper_s": measured["upper"],
+        "lower_s": measured["lower"],
+        "upper_expected_s": expected["upper"],
+        "lower_expected_s": expected["lower"],
+        "match_pct": 100 * hits / total if total else None,
+        "steps": [
+            {"step": s + 1, "zone": zone_of_step[s], "jaw": ZONE_JAW[zone_of_step[s]],
+             "on_jaw_pct": 100 * c[0] / c[1]}
+            for s, c in sorted(per_step.items())
+        ],
+    }
+
+
 def zone_centres(rows: list[dict], part: str = "all") -> dict[int, tuple]:
     """Average attitude per zone, from all of each step or from one half."""
     vectors: dict[int, list] = {}
@@ -432,6 +508,16 @@ def summary(session: Session) -> dict[str, Any]:
     if rec:
         out["recognition_pct"] = round(rec[0])
         out["recognition_by_zone"] = {str(z): round(p) for z, p in rec[1].items()}
+    jaws = jaw_coverage(session)
+    if jaws:
+        out["jaws"] = {
+            "upper_s": round(jaws["upper_s"]),
+            "lower_s": round(jaws["lower_s"]),
+            "upper_expected_s": round(jaws["upper_expected_s"]),
+            "lower_expected_s": round(jaws["lower_expected_s"]),
+            "match_pct": None if jaws["match_pct"] is None else round(jaws["match_pct"]),
+            "steps": [{**s, "on_jaw_pct": round(s["on_jaw_pct"])} for s in jaws["steps"]],
+        }
     return out
 
 
@@ -495,4 +581,14 @@ def format_report(session: Session) -> str:
         w("")
         w(f"Recognition (attitude only, same session): {overall:.0f} %")
         w("  " + "  ".join(f"zone {z}: {p:.0f} %" for z, p in per_zone.items()))
+
+    jaws = jaw_coverage(session)
+    if jaws and jaws["match_pct"] is not None:
+        w("")
+        w("Jaws (fixed rule, one second at a time)")
+        w(f"  upper {jaws['upper_s']:.0f} s of {jaws['upper_expected_s']:.0f} s, "
+          f"lower {jaws['lower_s']:.0f} s of {jaws['lower_expected_s']:.0f} s")
+        w(f"  on the paced jaw: {jaws['match_pct']:.0f} %")
+        w("  " + "  ".join(f"step {s['step']}: {s['on_jaw_pct']:.0f} %"
+                           for s in jaws["steps"]))
     return "\n".join(lines) + "\n"
